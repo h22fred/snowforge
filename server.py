@@ -209,123 +209,12 @@ WORKFLOW:
 4. Generate data using create_record / create_records_batch / run_script
 5. Clean up with cleanup_by_prefix when done
 
-═══════════════════════════════════════════════════════════════════
- DEMO DATA GENERATION — DOMAIN KNOWLEDGE
-═══════════════════════════════════════════════════════════════════
-
-When generating demo data, follow this creation order strictly.
-Parent records MUST exist before children that reference them.
-
-── CSDM FOUNDATION (always create first) ──────────────────────
-
-Creation order:
-1. cmdb_ci_business_capability — Business Capabilities (top of hierarchy)
-2. cmdb_ci_service_auto → Business Services (references business_capability)
-3. cmdb_ci_service_technical → Technical Services (references business_service)
-4. cmdb_ci_service → Application Services (references technical_service)
-5. cmdb_ci_server / cmdb_ci_db_instance / cmdb_ci_lb — CIs (reference app service)
-6. cmdb_rel_ci — Relationships between CIs (type + parent + child sys_ids)
-
-Key fields for services:
-- name: Always prefix with the project prefix (e.g. "SF-Acme-Payment Gateway")
-- service_classification: "Business Service" / "Technical Service" / "Application Service"
-- operational_status: 1 (Operational)
-- busines_criticality: "1 - most critical" / "2 - somewhat critical" / "3 - less critical"
-
-Relationship types (cmdb_rel_type):
-- "Depends on::Used by" — service dependencies
-- "Runs on::Runs" — app-to-server
-- "Contains::Contained by" — logical grouping
-
-IMPORTANT: After creating CSDM records, verify service maps render by checking
-cmdb_rel_ci relationships. Missing or wrong relationship types = broken maps.
-
-── ITSM OVERLAY ────────────────────────────────────────────────
-
-Tables: incident, problem, change_request, known_error
-Creation order: problem → known_error → incident → change_request
-
-Realistic ratios (per ~20 record set):
-- 8-10 incidents (mix of P1-P4, mostly P3)
-- 3-4 problems (root cause investigations)
-- 2-3 known errors (documented workarounds)
-- 3-4 change requests (mix: standard, normal, emergency)
-
-Story patterns (make data tell a story):
-- "Change caused incident": change_request → incident referencing the change
-- "Problem identified": multiple incidents → problem links them
-- "Known error with workaround": problem → known_error with workaround field
-
-Key fields:
-- incident: short_description, description, priority, urgency, impact, category, subcategory, assignment_group, cmdb_ci, state
-- problem: short_description, priority, known_error (boolean), related_incidents
-- change_request: short_description, type (standard/normal/emergency), risk, impact, start_date, end_date, cmdb_ci
-- Use describe_table to discover instance-specific fields
-
-GOTCHAS:
-- assignment_group must be a valid sys_id — use list_records on sys_user_group first
-- category/subcategory must match — invalid combos get silently corrected by business rules
-- state transitions: you can only set certain states at creation; others require intermediate states
-- Always set caller_id on incidents (use list_records on sys_user to find valid users)
-
-── CSM OVERLAY ─────────────────────────────────────────────────
-
-Tables: customer_account, customer_contact, sn_customerservice_case
-Creation order: customer_account → customer_contact → case
-
-Key fields:
-- customer_account: name, account_number, industry, city, state, country
-- customer_contact: first_name, last_name, email, phone, account (references customer_account)
-- sn_customerservice_case: short_description, account, contact, priority, product, category
-
-GOTCHAS:
-- Entitlements (service_entitlement): if the instance has entitlement checking enabled,
-  cases without valid entitlements may get auto-rejected by business rules
-- SLA definitions: attach to cases for realistic SLA tracking demo scenarios
-
-── HRSD OVERLAY ────────────────────────────────────────────────
-
-Tables: sn_hr_core_case, sn_hr_le_lifecycle_event, sn_hr_le_activity
-Creation order: lifecycle_event_type → lifecycle_event → activities → HR cases
-
-Key fields:
-- sn_hr_core_case: short_description, hr_service, subject_person, opened_for, state
-- sn_hr_le_lifecycle_event: name, lifecycle_event_type, employee
-- sn_hr_le_activity: name, lifecycle_event, assignment_group, state, order
-
-GOTCHAS:
-- hr_service must reference a valid HR service from sn_hr_core_service
-- subject_person and opened_for must be valid sys_user sys_ids
-- lifecycle_event_type controls which activities auto-generate — check the type first
-- Some HR tables require the HR plugin to be activated
-
-═══════════════════════════════════════════════════════════════════
- PREFIX CONVENTION
-═══════════════════════════════════════════════════════════════════
-
-ALL generated records MUST use a prefix in their name/short_description:
-  Format: SF-{CompanyShortName}-{description}
-  Example: SF-Acme-Payment Gateway Service
-
-This enables cleanup_by_prefix to find and delete all generated data.
-The prefix must appear in the first field that makes sense:
-- Services/CIs: name field
-- Incidents/problems/changes/cases: short_description field
-- Contacts: last_name field (e.g. "SF-Acme-Smith")
-- Accounts: name field
-
-═══════════════════════════════════════════════════════════════════
- BEST PRACTICES
-═══════════════════════════════════════════════════════════════════
-
-1. ALWAYS describe_table before creating records in an unfamiliar table
-2. ALWAYS list_records on reference tables to get valid sys_ids (don't guess)
-3. Create in dependency order: CSDM → ITSM → CSM → HRSD
-4. Use create_records_batch for efficiency (up to 50 per call)
-5. Verify after creation: list_records with prefix query to confirm
-6. If a create fails, check the error — often it's a missing required field or bad reference
-
-CROSS-REFERENCE: Use SSC_Retrieval to understand ServiceNow module best practices and data model relationships. Use account_insights to check customer data patterns.""",
+TIPS:
+- Use describe_table before creating records in an unfamiliar table
+- Use list_records to find valid reference sys_ids (assignment groups, users, categories)
+- Use create_records_batch for efficiency (up to 50 per call)
+- Prefix all generated record names for easy cleanup (e.g. SF-Acme-...)
+- Create parent records before children (respect foreign key references)""",
 )
 
 
