@@ -414,9 +414,11 @@ def validate_script(script: str) -> str:
 
     Checks for:
     - ES6+ syntax that will crash ServiceNow's Rhino engine
-    - Missing PREFIX variable
-    - Missing utility functions (createRecord, etc.)
-    - Common gotchas (hardcoded sys_ids, missing setWorkflow)
+    - Intrusion detection: writes to system tables (ACLs, scripts, properties, roles, credentials)
+    - Privilege escalation: Java package access, system property changes, encryption APIs
+    - Destructive operations: unscoped deletes, bulk deletes, sys_user/group deletions
+    - Data exfiltration: outbound HTTP calls from scripts
+    - Missing PREFIX variable, missing setWorkflow, hardcoded sys_ids
 
     ALWAYS run this before run_script.
 
@@ -443,21 +445,83 @@ def validate_script(script: str) -> str:
                 issues.append(f"ES5 violation: {message} (near position {m.start()})")
                 break  # One match per pattern is enough
 
-    # Dangerous operation checks
+    # ── Intrusion detection: only demo data operations allowed ──
+    intrusive = []
+
+    # System tables that should NEVER be modified by demo data scripts
+    _SYSTEM_TABLES = [
+        "sys_security_acl",       # ACLs
+        "sys_security_acl_role",  # ACL roles
+        "sys_script",             # Business rules
+        "sys_script_include",     # Script includes
+        "sys_ui_script",          # UI scripts
+        "sys_ui_policy",          # UI policies
+        "sys_ui_action",          # UI actions
+        "sys_ws_definition",      # Web services
+        "sys_rest_message",       # REST messages
+        "sys_properties",         # System properties
+        "sys_user_role",          # Role assignments
+        "sys_user_has_role",      # User role memberships
+        "sys_scope",              # Application scopes
+        "sys_app",                # Applications
+        "sys_update_set",         # Update sets
+        "sys_scheduled_job",      # Scheduled jobs (cron)
+        "sysauto_script",         # Scheduled script executions
+        "sys_trigger",            # System triggers
+        "sys_flow",               # Flow Designer flows
+        "sys_hub_flow",           # Flow Designer hub
+        "sys_email_notification", # Email notifications
+        "sys_script_fix",         # Fix scripts (we write here but shouldn't modify existing)
+        "oauth_entity",           # OAuth configs
+        "sys_certificate",        # Certificates
+        "sys_connection",         # Connection records
+        "sys_credential",         # Credentials
+    ]
+
+    for sys_table in _SYSTEM_TABLES:
+        # Check if script creates/modifies records in system tables (reading is OK)
+        pattern = rf"GlideRecord\s*\(\s*['\"]({re.escape(sys_table)})['\"]"
+        match = re.search(pattern, script)
+        if match:
+            # Check if it's just a read (query+next without insert/update/delete)
+            # Simple heuristic: if insert/update/delete/setValue appears, it's a write
+            if any(op in script for op in [".insert(", ".update(", ".deleteRecord(", ".setValue("]):
+                intrusive.append(f"CRITICAL: Script accesses system table '{sys_table}' with write operations — this is NOT demo data generation")
+
+    # Check for privilege escalation patterns
+    if re.search(r"setAbortAction\s*\(\s*false\s*\)", script):
+        intrusive.append("CRITICAL: setAbortAction(false) — bypasses security abort, potential privilege escalation")
+    if re.search(r"gs\.setProperty\s*\(", script):
+        intrusive.append("CRITICAL: gs.setProperty() — modifying system properties is not demo data generation")
+    if re.search(r"gs\.eventQueue\s*\(", script):
+        intrusive.append("WARNING: gs.eventQueue() — triggering system events, verify this is intentional")
+    if re.search(r"gs\.include\s*\(", script):
+        intrusive.append("WARNING: gs.include() — loading external script includes, verify source")
+    if re.search(r"Packages\.java\.", script):
+        intrusive.append("CRITICAL: Java package access — potential system-level exploit")
+    if re.search(r"GlideHTTPRequest|GlideHTTPClient|RESTMessageV2|SOAPMessageV2", script):
+        intrusive.append("WARNING: External HTTP call from script — verify this is not data exfiltration")
+    if re.search(r"email|smtp|notification", script, re.IGNORECASE) and "insert" in script:
+        intrusive.append("WARNING: Script may send emails — verify notifications won't go to real recipients")
+    if re.search(r"GlideEncrypter|EncryptionContext", script):
+        intrusive.append("CRITICAL: Encryption API access — not expected in demo data scripts")
+
+    if intrusive:
+        issues.extend(intrusive)
+
+    # ── Destructive operation checks ──
     dangerous = []
     if re.search(r"\.deleteRecord\s*\(", script) and "STARTSWITH" not in script and "PREFIX" not in script:
         dangerous.append("deleteRecord() without PREFIX/STARTSWITH filter — risk of deleting unscoped records")
     if re.search(r"\.deleteMultiple\s*\(", script):
         dangerous.append("deleteMultiple() found — bulk delete, verify scope is correct")
     if re.search(r"addQuery\s*\(\s*['\"]sys_id['\"]", script) is None and re.search(r"\.deleteRecord\s*\(", script):
-        # Deleting without a specific sys_id query — check there's SOME filter
         if "addQuery" not in script and "addEncodedQuery" not in script:
             dangerous.append("CRITICAL: deleteRecord() in a loop with NO query filter — this will delete ALL records in the table")
     if re.search(r"GlideRecord\s*\(\s*['\"]sys_user['\"]\s*\)", script) and "deleteRecord" in script:
         dangerous.append("WARNING: Deleting from sys_user table — this could remove real users")
     if re.search(r"GlideRecord\s*\(\s*['\"]sys_user_group['\"]\s*\)", script) and "deleteRecord" in script:
         dangerous.append("WARNING: Deleting from sys_user_group table — this could remove real groups")
-    # Check for drops/truncates (shouldn't happen in GlideRecord but just in case)
     if re.search(r"(DROP\s+TABLE|TRUNCATE|DELETE\s+FROM)", script, re.IGNORECASE):
         dangerous.append("CRITICAL: Raw SQL-style destructive operation detected")
 
@@ -507,10 +571,28 @@ def run_script(script: str, skip_validation: bool = False) -> str:
     if not _instance_url or not _session_cookies:
         raise RuntimeError("Not connected — call connect_instance first")
 
-    # Safety gate: run validation and block on dangerous patterns
+    # Safety gate: run validation and block on dangerous/intrusive patterns
     if not skip_validation:
         import re
-        # Quick check for the most dangerous patterns
+
+        # Block 1: System table writes
+        _BLOCKED_TABLES = [
+            "sys_security_acl", "sys_script", "sys_script_include", "sys_properties",
+            "sys_user_role", "sys_user_has_role", "sys_scheduled_job", "sysauto_script",
+            "sys_trigger", "oauth_entity", "sys_certificate", "sys_credential",
+        ]
+        for t in _BLOCKED_TABLES:
+            if t in script and any(op in script for op in [".insert(", ".update(", ".setValue("]):
+                return (f"BLOCKED: Script writes to system table '{t}'. "
+                        "This is not demo data generation. If intentional, run validate_script first, "
+                        "then call run_script with skip_validation=true after user approval.")
+
+        # Block 2: Privilege escalation
+        if "Packages.java." in script or "gs.setProperty" in script or "GlideEncrypter" in script:
+            return ("BLOCKED: Script contains system-level operations (Java packages, system properties, or encryption). "
+                    "Run validate_script first, then if the user approves, call run_script with skip_validation=true.")
+
+        # Block 3: Unscoped deletes
         has_delete = re.search(r"\.deleteRecord\s*\(|\.deleteMultiple\s*\(", script)
         has_scope = "STARTSWITH" in script or "PREFIX" in script or "addQuery" in script or "addEncodedQuery" in script
         if has_delete and not has_scope:
