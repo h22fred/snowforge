@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-Snowforge MCP — ServiceNow demo data forge.
-Chrome CDP auth, full CRUD on any table, prefix-based cleanup.
+Snowforge MCP — ServiceNow instance connector for SNODGE.
+Chrome CDP auth, instance inspection, script execution, and verification.
+
+Snowforge is the eyes and hands. SNODGE (Claude Project) is the brain.
+- Snowforge connects to the instance and gathers real data (groups, users, schemas)
+- SNODGE generates scripts using that real data
+- Snowforge executes the scripts and verifies results
 
 Credits:
 - Patrick Spieler — SNODGE concept (automated modular demo data generation)
@@ -59,14 +64,12 @@ def launch_chrome(instance_url: str) -> str:
     _instance_url = instance_url.rstrip("/")
     _session_cookies = None
 
-    # Check if Chrome is already running on our port
     try:
         _cdp_get("/json/version")
         return "Chrome already running — extracting cookies..."
     except Exception:
         pass
 
-    # Launch Chrome
     os.makedirs(CHROME_PROFILE, exist_ok=True)
     chrome_paths = [
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
@@ -200,23 +203,26 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP(
     "snowforge",
-    instructions="""Snowforge — ServiceNow demo data forge. Connects to any instance via Chrome session (SSO/MFA compatible).
+    instructions="""Snowforge — ServiceNow instance connector for SNODGE demo data generation.
+
+ROLE: Snowforge is the eyes and hands. SNODGE (Claude Project) is the brain.
+- Snowforge connects, inspects, executes, and verifies
+- SNODGE decides what data to create and generates the scripts
 
 WORKFLOW:
-1. User provides instance name → call connect_instance (launches Chrome)
-2. User logs in via Chrome (SSO/MFA/whatever their instance uses)
-3. User says "ready" → call complete_login (extracts session cookies)
-4. Generate data using create_record / create_records_batch / run_script
-5. Clean up with cleanup_by_prefix when done
-
-TIPS:
-- Use describe_table before creating records in an unfamiliar table
-- Use list_records to find valid reference sys_ids (assignment groups, users, categories)
-- Use create_records_batch for efficiency (up to 50 per call)
-- Prefix all generated record names for easy cleanup (e.g. SF-Acme-...)
-- Create parent records before children (respect foreign key references)""",
+1. connect_instance → Chrome launches, user logs in (SSO/MFA/whatever)
+2. complete_login → session cookies extracted
+3. INSPECT the instance for SNODGE:
+   - describe_table → check what fields exist, which are mandatory
+   - list_records → find real sys_ids (groups, users, rel types, categories)
+   - check_table_exists → verify plugins are active before generating scripts
+4. SNODGE generates Background Scripts using the real data from step 3
+5. run_script → execute SNODGE scripts on the instance
+6. list_records → verify records were created correctly""",
 )
 
+
+# ── Tools: Connection ────────────────────────────────────────────────────────
 
 @mcp.tool()
 def connect_instance(instance_name: str) -> str:
@@ -241,9 +247,57 @@ def connect_instance(instance_name: str) -> str:
 
 @mcp.tool()
 def complete_login() -> str:
-    """Extract session cookies after the user has logged in via Chrome. Call this after the user confirms they've logged in."""
+    """Extract session cookies after the user has logged in via Chrome.
+    Call this after the user confirms they've logged in."""
     cookies = extract_cookies()
     return f"Session authenticated — {len(cookies.split(';'))} cookies extracted. Ready to query."
+
+
+# ── Tools: Instance Inspection (feed data to SNODGE) ────────────────────────
+
+@mcp.tool()
+def describe_table(table: str) -> str:
+    """Get the schema/field definitions for a ServiceNow table.
+    Returns field names, types, labels, whether they're mandatory, and reference targets.
+
+    Use this BEFORE generating scripts to understand what fields exist on this specific instance.
+
+    Args:
+        table: Table name (e.g. incident, cmdb_ci_server, sn_customerservice_case)
+    """
+    table = _validate_table(table)
+
+    dict_result = _sn_request(
+        "GET",
+        f"/api/now/table/sys_dictionary?sysparm_query=name={table}&sysparm_fields=element,column_label,internal_type,mandatory,reference&sysparm_limit=200",
+    )
+
+    if "error" in dict_result:
+        return f"Could not describe table: {dict_result['error']}"
+
+    fields = dict_result.get("result", [])
+    if not fields:
+        return f"No field definitions found for table '{table}'. Check the table name or verify the plugin is active."
+
+    lines = [f"Table: {table} — {len(fields)} fields\n"]
+    lines.append(f"{'Field':<30} {'Label':<30} {'Type':<20} {'Req':<5} {'Reference'}")
+    lines.append("-" * 120)
+
+    for f in sorted(fields, key=lambda x: x.get("element", "")):
+        element = f.get("element", "")
+        if not element or element.startswith("sys_"):
+            continue
+        label = f.get("column_label", "")
+        ftype = f.get("internal_type", {})
+        if isinstance(ftype, dict):
+            ftype = ftype.get("value", ftype.get("display_value", ""))
+        mandatory = "YES" if f.get("mandatory") == "true" else ""
+        ref = f.get("reference", {})
+        if isinstance(ref, dict):
+            ref = ref.get("value", ref.get("display_value", ""))
+        lines.append(f"{element:<30} {label:<30} {ftype:<20} {mandatory:<5} {ref}")
+
+    return "\n".join(lines)
 
 
 @mcp.tool()
@@ -255,15 +309,18 @@ def list_records(
     offset: int = 0,
     order_by: str = "",
 ) -> str:
-    """List records from any ServiceNow table.
+    """Query records from any ServiceNow table via REST API.
+
+    Primary use: gather real sys_ids for SNODGE scripts (groups, users, rel types, categories).
+    Secondary use: verify records after script execution.
 
     Args:
-        table: Table name (e.g. incident, sn_grc_profile, cmdb_ci_server)
-        query: Encoded query filter (e.g. 'active=true^priority=1')
-        fields: Comma-separated fields to return (empty = all fields)
+        table: Table name (e.g. sys_user_group, cmdb_rel_type, sys_user)
+        query: Encoded query filter (e.g. 'active=true^nameSTARTSWITHIT')
+        fields: Comma-separated fields to return (e.g. 'sys_id,name' — empty = all)
         limit: Max records to return (default 20, max 100)
         offset: Pagination offset
-        order_by: Field to order by (prefix with - for descending, e.g. '-sys_created_on')
+        order_by: Field to order by (prefix with - for descending)
     """
     table = _validate_table(table)
     limit = min(limit, 100)
@@ -310,264 +367,41 @@ def get_record(table: str, sys_id: str, fields: str = "") -> str:
 
 
 @mcp.tool()
-def create_record(table: str, record: dict) -> str:
-    """Create a new record in any ServiceNow table.
+def check_table_exists(table: str) -> str:
+    """Check if a table exists on the instance (i.e. if the required plugin is active).
 
-    IMPORTANT: Before creating, use describe_table to understand required fields and valid values.
-    For reference fields, use list_records to find valid sys_ids.
-    Always prefix record names with SF-{CompanyName}- for cleanup.
+    Use this to verify module availability before SNODGE generates scripts.
+    E.g. check sn_customerservice_case before generating CSM scripts.
 
     Args:
-        table: Table name (e.g. incident, sn_grc_profile)
-        record: Field/value pairs for the new record
+        table: Table name to check
     """
     table = _validate_table(table)
 
-    result = _sn_request("POST", f"/api/now/table/{table}", record)
+    result = _sn_request("GET", f"/api/now/table/{table}?sysparm_limit=0")
 
     if "error" in result:
-        return f"Error creating record: {result['error']}"
+        status_code = result.get("status", "unknown")
+        if status_code == 404 or "Invalid table" in str(result.get("error", "")):
+            return f"Table '{table}' does NOT exist. The required plugin may not be activated."
+        return f"Error checking table: {result['error']}"
 
-    created = result.get("result", {})
-    sys_id = created.get("sys_id", "unknown")
-    number = created.get("number", "")
-    label = f" ({number})" if number else ""
-    return f"Created {table} record{label}: sys_id={sys_id}\n\n{json.dumps(created, indent=2)}"
-
-
-@mcp.tool()
-def create_records_batch(table: str, records: list[dict]) -> str:
-    """Create multiple records in a ServiceNow table. Records are created sequentially.
-
-    IMPORTANT: Maximum 50 records per call to prevent runaway creation.
-    Always prefix record names with SF-{CompanyName}- for cleanup.
-
-    Args:
-        table: Table name
-        records: List of field/value dicts (max 50)
-    """
-    table = _validate_table(table)
-
-    if len(records) > 50:
-        return "Maximum 50 records per batch. Split into smaller batches."
-
-    results = []
-    for i, rec in enumerate(records):
-        result = _sn_request("POST", f"/api/now/table/{table}", rec)
-        if "error" in result:
-            results.append(f"[FAIL] Record {i+1}: {result['error'][:200]}")
-        else:
-            created = result.get("result", {})
-            sys_id = created.get("sys_id", "?")
-            number = created.get("number", "")
-            label = f" ({number})" if number else ""
-            results.append(f"[OK] Record {i+1}{label}: {sys_id}")
-
-    return f"Batch create on {table}: {len(records)} records\n\n" + "\n".join(results)
+    return f"Table '{table}' exists and is accessible."
 
 
-@mcp.tool()
-def update_record(table: str, sys_id: str, record: dict) -> str:
-    """Update an existing record.
-
-    Args:
-        table: Table name
-        sys_id: Record sys_id (32-char hex)
-        record: Field/value pairs to update (only include fields you want to change)
-    """
-    table = _validate_table(table)
-    sys_id = _validate_sys_id(sys_id)
-
-    result = _sn_request("PATCH", f"/api/now/table/{table}/{sys_id}", record)
-
-    if "error" in result:
-        return f"Error: {result['error']}"
-
-    updated = result.get("result", {})
-    return f"Updated {table}/{sys_id}\n\n{json.dumps(updated, indent=2)}"
-
-
-@mcp.tool()
-def delete_record(table: str, sys_id: str) -> str:
-    """Delete a record. IMPORTANT: Always confirm with the user before deleting.
-
-    Args:
-        table: Table name
-        sys_id: Record sys_id (32-char hex)
-    """
-    table = _validate_table(table)
-    sys_id = _validate_sys_id(sys_id)
-
-    result = _sn_request("DELETE", f"/api/now/table/{table}/{sys_id}")
-
-    if "error" in result:
-        return f"Error: {result['error']}"
-
-    return f"Deleted {table}/{sys_id}"
-
-
-@mcp.tool()
-def describe_table(table: str) -> str:
-    """Get the schema/field definitions for a ServiceNow table.
-    Returns field names, types, labels, and whether they're mandatory.
-    Essential before creating records — shows what fields are available and required.
-
-    Args:
-        table: Table name (e.g. incident, cmdb_ci_server)
-    """
-    table = _validate_table(table)
-
-    dict_result = _sn_request(
-        "GET",
-        f"/api/now/table/sys_dictionary?sysparm_query=name={table}&sysparm_fields=element,column_label,internal_type,mandatory,reference&sysparm_limit=200",
-    )
-
-    if "error" in dict_result:
-        return f"Could not describe table: {dict_result['error']}"
-
-    fields = dict_result.get("result", [])
-    if not fields:
-        return f"No field definitions found for table '{table}'. Check the table name."
-
-    lines = [f"Table: {table} — {len(fields)} fields\n"]
-    lines.append(f"{'Field':<30} {'Label':<30} {'Type':<20} {'Req':<5} {'Reference'}")
-    lines.append("-" * 120)
-
-    for f in sorted(fields, key=lambda x: x.get("element", "")):
-        element = f.get("element", "")
-        if not element or element.startswith("sys_"):
-            continue
-        label = f.get("column_label", "")
-        ftype = f.get("internal_type", {})
-        if isinstance(ftype, dict):
-            ftype = ftype.get("value", ftype.get("display_value", ""))
-        mandatory = "YES" if f.get("mandatory") == "true" else ""
-        ref = f.get("reference", {})
-        if isinstance(ref, dict):
-            ref = ref.get("value", ref.get("display_value", ""))
-        lines.append(f"{element:<30} {label:<30} {ftype:<20} {mandatory:<5} {ref}")
-
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def cleanup_by_prefix(prefix: str, tables: list[str] | None = None) -> str:
-    """Delete all Snowforge-generated records matching a prefix.
-
-    Searches common tables (or specified tables) for records where name or
-    short_description starts with the given prefix, then deletes them in
-    reverse dependency order (children first, parents last).
-
-    Args:
-        prefix: The prefix to search for (e.g. 'SF-Acme')
-        tables: Optional list of tables to clean. If not provided, cleans all standard tables.
-    """
-    # Default tables in reverse dependency order (children first)
-    default_tables = [
-        # HRSD
-        ("sn_hr_le_activity", "short_description"),
-        ("sn_hr_le_lifecycle_event", "name"),
-        ("sn_hr_core_case", "short_description"),
-        # CSM
-        ("sn_customerservice_case", "short_description"),
-        ("customer_contact", "last_name"),
-        ("customer_account", "name"),
-        # ITSM
-        ("change_request", "short_description"),
-        ("known_error", "short_description"),
-        ("incident", "short_description"),
-        ("problem", "short_description"),
-        # CSDM — CIs first, then services, then capabilities
-        ("cmdb_rel_ci", None),  # Special: handled via parent/child lookup
-        ("cmdb_ci_server", "name"),
-        ("cmdb_ci_db_instance", "name"),
-        ("cmdb_ci_lb", "name"),
-        ("cmdb_ci_service", "name"),
-        ("cmdb_ci_service_technical", "name"),
-        ("cmdb_ci_service_auto", "name"),
-        ("cmdb_ci_business_capability", "name"),
-    ]
-
-    if tables:
-        # User specified tables — assume name field, they can use short_description in query
-        target_tables = [(t, "name") for t in tables]
-    else:
-        target_tables = default_tables
-
-    results = []
-    total_deleted = 0
-
-    for table, field in target_tables:
-        try:
-            table = _validate_table(table)
-        except ValueError:
-            results.append(f"[SKIP] {table}: invalid table name")
-            continue
-
-        # Build query
-        if field is None:
-            # cmdb_rel_ci: skip for now, relationships get orphaned but harmless
-            continue
-        query = f"{field}STARTSWITH{prefix}"
-
-        # Find matching records
-        try:
-            find_result = _sn_request(
-                "GET",
-                f"/api/now/table/{table}?sysparm_query={urllib.parse.quote(query)}&sysparm_fields=sys_id,{field}&sysparm_limit=200",
-            )
-        except RuntimeError as e:
-            results.append(f"[SKIP] {table}: {e}")
-            continue
-
-        if "error" in find_result:
-            # Table might not exist on this instance — skip silently
-            continue
-
-        records = find_result.get("result", [])
-        if not records:
-            continue
-
-        # Delete each record
-        deleted = 0
-        failed = 0
-        for rec in records:
-            sid = rec.get("sys_id")
-            if not sid:
-                continue
-            try:
-                del_result = _sn_request("DELETE", f"/api/now/table/{table}/{sid}")
-                if "error" in del_result:
-                    failed += 1
-                else:
-                    deleted += 1
-            except Exception:
-                failed += 1
-
-        total_deleted += deleted
-        status = f"deleted {deleted}"
-        if failed:
-            status += f", {failed} failed"
-        results.append(f"[{table}] {status}")
-
-    summary = f"Cleanup complete: {total_deleted} records deleted across {len(results)} tables"
-    if results:
-        summary += "\n\n" + "\n".join(results)
-    else:
-        summary += f"\n\nNo records found with prefix '{prefix}'"
-
-    return summary
-
+# ── Tools: Script Execution ──────────────────────────────────────────────────
 
 @mcp.tool()
 def run_script(script: str) -> str:
-    """Execute a background script on the ServiceNow instance (server-side JavaScript).
+    """Execute a Background Script on the ServiceNow instance (server-side JavaScript).
+
+    This is the primary tool for running SNODGE-generated scripts.
+    Scripts run in ServiceNow's Rhino engine (ES5 only).
 
     IMPORTANT: Always show the script to the user and get approval before running.
-    Uses the sys_script_fix table to submit one-time fix scripts.
 
     Args:
-        script: JavaScript code to execute (ServiceNow server-side GlideRecord API)
+        script: JavaScript code to execute (GlideRecord API, ES5 syntax only)
     """
     if not _instance_url or not _session_cookies:
         raise RuntimeError("Not connected — call connect_instance first")
