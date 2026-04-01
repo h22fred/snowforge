@@ -389,22 +389,133 @@ def check_table_exists(table: str) -> str:
     return f"Table '{table}' exists and is accessible."
 
 
-# ── Tools: Script Execution ──────────────────────────────────────────────────
+# ── Tools: Script Validation & Execution ─────────────────────────────────────
+
+# ES6+ patterns that will crash ServiceNow's Rhino engine (ES5 only)
+_ES6_PATTERNS = [
+    (r"=>",                          "Arrow function (=>) — use 'function() {}' instead"),
+    (r"\blet\s",                     "let declaration — use 'var' instead"),
+    (r"\bconst\s",                   "const declaration — use 'var' instead"),
+    (r"`[^`]*`",                     "Template literal (backticks) — use string concatenation instead"),
+    (r"\.\.\.\w",                    "Spread operator (...) — not supported in ES5"),
+    (r"\b(class)\s+\w+",            "class declaration — use function/prototype instead"),
+    (r"\bimport\s",                  "import statement — not supported"),
+    (r"\bexport\s",                  "export statement — not supported"),
+    (r"(?:var|let|const)\s*\{",      "Destructuring assignment — not supported in ES5"),
+    (r"(?:var|let|const)\s*\[",      "Array destructuring — not supported in ES5"),
+    (r"\basync\s",                   "async function — not supported in ES5"),
+    (r"\bawait\s",                   "await — not supported in ES5"),
+]
+
 
 @mcp.tool()
-def run_script(script: str) -> str:
+def validate_script(script: str) -> str:
+    """Sanity-check a SNODGE script before executing it.
+
+    Checks for:
+    - ES6+ syntax that will crash ServiceNow's Rhino engine
+    - Missing PREFIX variable
+    - Missing utility functions (createRecord, etc.)
+    - Common gotchas (hardcoded sys_ids, missing setWorkflow)
+
+    ALWAYS run this before run_script.
+
+    Args:
+        script: JavaScript code to validate
+    """
+    import re
+    issues = []
+
+    # ES6+ syntax checks
+    for pattern, message in _ES6_PATTERNS:
+        # Skip patterns inside string literals and comments (simple heuristic)
+        if re.search(pattern, script):
+            # Check it's not inside a string
+            matches = list(re.finditer(pattern, script))
+            for m in matches:
+                # Simple check: count unescaped quotes before match
+                before = script[:m.start()]
+                # Skip if inside a single-line comment
+                last_newline = before.rfind("\n")
+                line = before[last_newline + 1:]
+                if "//" in line and line.index("//") < len(line) - len(before) + m.start():
+                    continue
+                issues.append(f"ES5 violation: {message} (near position {m.start()})")
+                break  # One match per pattern is enough
+
+    # Dangerous operation checks
+    dangerous = []
+    if re.search(r"\.deleteRecord\s*\(", script) and "STARTSWITH" not in script and "PREFIX" not in script:
+        dangerous.append("deleteRecord() without PREFIX/STARTSWITH filter — risk of deleting unscoped records")
+    if re.search(r"\.deleteMultiple\s*\(", script):
+        dangerous.append("deleteMultiple() found — bulk delete, verify scope is correct")
+    if re.search(r"addQuery\s*\(\s*['\"]sys_id['\"]", script) is None and re.search(r"\.deleteRecord\s*\(", script):
+        # Deleting without a specific sys_id query — check there's SOME filter
+        if "addQuery" not in script and "addEncodedQuery" not in script:
+            dangerous.append("CRITICAL: deleteRecord() in a loop with NO query filter — this will delete ALL records in the table")
+    if re.search(r"GlideRecord\s*\(\s*['\"]sys_user['\"]\s*\)", script) and "deleteRecord" in script:
+        dangerous.append("WARNING: Deleting from sys_user table — this could remove real users")
+    if re.search(r"GlideRecord\s*\(\s*['\"]sys_user_group['\"]\s*\)", script) and "deleteRecord" in script:
+        dangerous.append("WARNING: Deleting from sys_user_group table — this could remove real groups")
+    # Check for drops/truncates (shouldn't happen in GlideRecord but just in case)
+    if re.search(r"(DROP\s+TABLE|TRUNCATE|DELETE\s+FROM)", script, re.IGNORECASE):
+        dangerous.append("CRITICAL: Raw SQL-style destructive operation detected")
+
+    if dangerous:
+        issues.extend(dangerous)
+
+    # PREFIX check
+    if "PREFIX" not in script and "prefix" not in script.lower():
+        issues.append("Missing PREFIX variable — all records should be prefixed for cleanup")
+
+    # setWorkflow check
+    if "GlideRecord" in script and "setWorkflow" not in script:
+        issues.append("Missing setWorkflow(false) — business rules may interfere with data generation")
+
+    # Hardcoded sys_id check (32-char hex that looks like a sys_id)
+    hardcoded = re.findall(r"['\"][0-9a-f]{32}['\"]", script, re.IGNORECASE)
+    if hardcoded:
+        issues.append(f"Found {len(hardcoded)} hardcoded sys_id(s) — consider dynamic lookup instead: {hardcoded[0][:20]}...")
+
+    # Common utility functions
+    if "createRecord" in script:
+        # Check it's defined, not just called
+        if "function createRecord" not in script:
+            issues.append("createRecord() is called but not defined — each script must be self-contained")
+
+    if not issues:
+        line_count = script.count("\n") + 1
+        return f"Script looks good ({line_count} lines). No ES5 violations or common issues found."
+
+    return f"Found {len(issues)} issue(s):\n\n" + "\n".join(f"- {i}" for i in issues)
+
+
+@mcp.tool()
+def run_script(script: str, skip_validation: bool = False) -> str:
     """Execute a Background Script on the ServiceNow instance (server-side JavaScript).
 
     This is the primary tool for running SNODGE-generated scripts.
     Scripts run in ServiceNow's Rhino engine (ES5 only).
 
-    IMPORTANT: Always show the script to the user and get approval before running.
+    IMPORTANT: Always call validate_script first, then show the script to the user
+    and get approval before running.
 
     Args:
         script: JavaScript code to execute (GlideRecord API, ES5 syntax only)
+        skip_validation: Set to true only if the user explicitly approves after seeing validation warnings
     """
     if not _instance_url or not _session_cookies:
         raise RuntimeError("Not connected — call connect_instance first")
+
+    # Safety gate: run validation and block on dangerous patterns
+    if not skip_validation:
+        import re
+        # Quick check for the most dangerous patterns
+        has_delete = re.search(r"\.deleteRecord\s*\(|\.deleteMultiple\s*\(", script)
+        has_scope = "STARTSWITH" in script or "PREFIX" in script or "addQuery" in script or "addEncodedQuery" in script
+        if has_delete and not has_scope:
+            return ("BLOCKED: Script contains delete operations without clear scoping (PREFIX/STARTSWITH/addQuery). "
+                    "Run validate_script first, then if the user approves, call run_script with skip_validation=true.")
 
     result = _sn_request(
         "POST",
